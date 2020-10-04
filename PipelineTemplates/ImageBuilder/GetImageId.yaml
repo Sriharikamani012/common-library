@@ -1,0 +1,63 @@
+# ------------------------------------------------------------------------------
+# .SYNOPSIS
+#   This template creates an image.auto.tfvars file to be used in the Terraform
+#   Deploy so that a VM or VMSS definition may reference the appropriate 
+#   variable. 
+# .DESCRIPTION
+#   This pipeline will build an image.auto.tfvars
+# .ASSUMPTIONS:
+#     1. The image provided exists
+# .NOTES
+#     File Name      : GetImageId.yaml
+#     Prerequisite   : ADO Multi-Stage Yaml Pipeline
+# ------------------------------------------------------------------------------
+
+parameters:
+- name: serviceConnection
+  type: string
+  displayName: 'The service connection'
+
+- name: tf_variable_name
+  type: string
+  displayName: 'The name of terraform variable'
+  
+- name: dest_sig_rg
+  type: string
+  displayName: 'The destination shared image gallery resource group in vp shared services'
+
+- name: dest_sig
+  type: string
+  displayName: 'The destination shared image gallery in vp shared services'
+
+- name: dest_sig_definition
+  type: string
+  displayName: 'The destination definition in the shared image gallery in vp shared services'
+
+- name: dest_sig_version
+  type: string
+  displayName: 'The destination version in the shared image gallery in vp shared services'
+
+steps:
+- task: AzureCLI@2
+  displayName: Get Image ID
+  inputs:
+    azureSubscription: ${{ parameters.serviceConnection }}
+    addSpnToEnvironment: true
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+        ARM_SUBSCRIPTION_ID=$(az account show --query id --out tsv)
+
+        # go to terraform repo path
+        cd $(Build.Repository.Name)/Terraform
+
+        # build the resource id of the given image
+        imageID=/subscriptions/$ARM_SUBSCRIPTION_ID/resourceGroups/${{ parameters.dest_sig_rg }}/providers/Microsoft.Compute/galleries/${{ parameters.dest_sig }}/images/${{ parameters.dest_sig_definition }}/versions/${{ parameters.dest_sig_version }}
+
+        echo "Inserting Image ID in auto.tfvars file"
+
+        # append variables to ./image.auto.tfvars
+        echo "${{ parameters.tf_variable_name}}=\"$imageID"\" >> ./image.auto.tfvars
+
+        echo "./image.auto.tfvars contents:"
+        cat ./image.auto.tfvars

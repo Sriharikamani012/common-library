@@ -1,0 +1,208 @@
+# ------------------------------------------------------------------------------
+# .SYNOPSIS
+#   This template builds a specific packer definition to a shared vp tower
+# .DESCRIPTION
+#   This pipeline will build an image in vp shared services
+# .ASSUMPTIONS:
+#     1. There is a CI Artifact zip with a packer definition
+#     2. This zip stays in a blob account within the vp shared services
+#     3. The PARAMETER serviceConnection has "Storage Blob Data Reader"
+#        to the ci storage account
+
+# .NOTES
+#     File Name      : Build.yaml
+#     Prerequisite   : ADO Multi-Stage Yaml Pipeline
+# ------------------------------------------------------------------------------
+parameters:
+- name: serviceConnection
+  type: string
+  displayName: 'The service connection'
+
+- name: container_name
+  type: string
+  displayName: 'The name of the container that hosts this blob'
+
+- name: sa_name
+  type: string
+  displayName: 'The ci storage account name in vp shared services'
+
+- name: blob
+  type: string
+  displayName: 'The name of the blob that hosts this zip file'
+
+- name: folder_def
+  type: string
+  displayName: 'The folder name that the Packer definition resides (ex. TodoApp)'
+
+- name: packer_def
+  type: string
+  displayName: 'Name of the packer json. (ex. Packer.json)'
+
+- name: base_sig_subid
+  type: string
+  displayName: 'The base shared image gallerys subscription id where the vanilla image exists'
+
+- name: base_sig_rg
+  type: string
+  displayName: 'The base shared image gallery resource group name where the vanilla image exists'
+
+- name: base_sig
+  type: string
+  displayName: 'The base shared image gallery name where the vanilla image exists'
+
+- name: base_sig_definition
+  type: string
+  displayName: 'The base shared image definition where the vanilla image exists'
+
+- name: base_sig_version
+  type: string
+  displayName: 'The base shared image definitions version where the vanilla image exists'
+
+- name: dest_sig_rg
+  type: string
+  displayName: 'The destination shared image gallery resource group in vp shared services'
+
+- name: dest_sig
+  type: string
+  displayName: 'The destination shared image gallery in vp shared services'
+
+- name: dest_sig_definition
+  type: string
+  displayName: 'The destination definition in the shared image gallery in vp shared services'
+
+- name: dest_sig_version
+  type: string
+  displayName: 'The destination version in the shared image gallery in vp shared services'
+
+- name: virtual_network_resource_group_name
+  type: string
+  displayName: 'The base resource group in vp shared services. This rg will contain the virtual network'
+
+- name: virtual_network_name
+  type: string
+  displayName: 'The virtual network in vp shared services'
+
+- name: virtual_network_subnet_name
+  type: string
+  displayName: 'The subnet in vp shared services to deploy the temporary packer vm provioner'
+
+- name: managed_image_resource_group_name
+  type: string
+  displayName: 'The resource group to place the custom image in vp shared services'
+
+- name: location
+  type: string
+  displayName: 'Location of the Azure Resources'
+
+steps:
+- task: AzureCLI@2
+  displayName: Download CI IaaS Blob
+  inputs:
+    azureSubscription: ${{ parameters.serviceConnection }}
+    addSpnToEnvironment: true
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+        ARM_SUBSCRIPTION_ID=$(az account show --query id --out tsv)
+        echo "##vso[task.setvariable variable=SPN_ID]$servicePrincipalId"
+        echo "##vso[task.setvariable variable=SPN_KEY]$servicePrincipalKey"
+        echo "##vso[task.setvariable variable=TENANT_ID]$tenantId"
+        echo "##vso[task.setvariable variable=ARM_SUBSCRIPTION_ID]$ARM_SUBSCRIPTION_ID"
+
+        echo "##vso[task.setvariable variable=isBuildImage]false"
+    
+        set +e # errors don't matter
+        # deploy sig definition
+        az sig image-definition show  --ids "/subscriptions/$ARM_SUBSCRIPTION_ID/resourceGroups/${{parameters.dest_sig_rg}}/providers/Microsoft.Compute/galleries/${{parameters.dest_sig}}/images/${{parameters.dest_sig_definition}}"
+        if [ $? -eq 0 ]
+          then
+              echo "Using shared image gallery ${{parameters.dest_sig}} in resource group ${{parameters.dest_sig_rg}} and image ${{parameters.dest_sig_definition}}"
+          else
+              az sig image-definition create \
+                              --resource-group ${{parameters.dest_sig_rg}} \
+                              --gallery-name ${{parameters.dest_sig}} \
+                              --gallery-image-definition ${{parameters.dest_sig_definition}} \
+                              --publisher "ATT" \
+                              --offer ${{parameters.dest_sig_definition}} \
+                              --sku "1.0" \
+                              --os-type Linux \
+                              --tags 'BuildNumber=$(Build.BuildNumber)'
+        fi
+        set -e # errors matter
+        
+        # retrieve md5 of blob and check if blob exists
+        md5="$(az storage blob show  \
+                  --container-name ${{parameters.container_name}} \
+                  --name ${{parameters.blob}} \
+                  --account-name ${{parameters.sa_name}} \
+                  --auth-mode login \
+                  --query properties.contentSettings.contentMd5)"
+
+        #remove quotes
+        md5=${md5//\"}
+
+        echo "##vso[task.setvariable variable=blob_hash]$md5"
+
+        # search image versions for tag that matches md5. set vso:isBuildImage to false if check_md5 -eq true
+
+        set +e
+        check_md5="$(az sig image-version list --gallery-image-definition ${{parameters.dest_sig_definition}} \
+                                  --gallery-name ${{parameters.dest_sig}} \
+                                  --resource-group ${{parameters.dest_sig_rg}} | \
+                                  jq '.[] | .tags' | grep $md5)"
+
+        #remove quotes
+        check_md5=${check_md5//\"}
+        echo "[$check_md5]"
+
+        if [ -z "$check_md5" ];
+          then
+            # todo - make smarter to point to which version matches the md5
+            echo "The package image version with the tag $md5 has NOT been built..."
+            echo "##vso[task.setvariable variable=isBuildImage]true"
+          else
+            echo "The package image version with the tag $md5 has already been built yet."
+        fi
+
+        # Download even if check_md5 exists b/c the CD pipeline needs the package artifact, Start.sh (aka cloudinit script) 
+
+        cd '$(Build.ArtifactStagingDirectory)'
+
+        az storage blob download --container-name ${{parameters.container_name}} \
+                                 --file ./${{parameters.blob}} \
+                                 --name ${{parameters.blob}} \
+                                 --account-name ${{parameters.sa_name}} \
+                                 --auth-mode login
+        unzip ./${{parameters.blob}}
+
+
+
+- task: PackerBuild@1
+  condition: and(succeeded(), eq(variables['isBuildImage'], 'true'))
+  displayName: Build Custom Image
+  inputs:
+    templateType: 'custom'
+    customTemplateLocation: '$(Build.ArtifactStagingDirectory)/${{parameters[''folder_def'']}}/${{parameters[''packer_def'']}}'
+    # uncomment below for testing Packer.json from kit rather than from blob
+    # customTemplateLocation: '$(Build.SourcesDirectory)/TodoApp/Packer.json'
+    customTemplateParameters: '{"client_id":"$(SPN_ID)","client_secret":"$(SPN_KEY)","tenant_id":"$(TENANT_ID)","subscription_id":"$(ARM_SUBSCRIPTION_ID)","base_sig_subid":"${{ parameters[''base_sig_subid''] }}","base_sig_rg":"${{ parameters[''base_sig_rg''] }}","base_sig":"${{ parameters[''base_sig''] }}","base_sig_definition":"${{ parameters[''base_sig_definition''] }}","base_sig_version":"${{ parameters[''base_sig_version''] }}","dest_sig_rg":"${{ parameters[''dest_sig_rg''] }}","dest_sig":"${{ parameters[''dest_sig''] }}","dest_sig_definition":"${{ parameters[''dest_sig_definition''] }}","dest_sig_version":"${{ parameters[''dest_sig_version''] }}","location":"${{ parameters[''location''] }}" ,"zip_path":"$(Build.ArtifactStagingDirectory)/${{parameters[''blob'']}}","virtual_network_resource_group_name": "${{ parameters[''virtual_network_resource_group_name''] }}","virtual_network_name": "${{ parameters[''virtual_network_name''] }}","virtual_network_subnet_name": "${{ parameters[''virtual_network_subnet_name''] }}","managed_image_resource_group_name": "${{ parameters[''managed_image_resource_group_name''] }}"}'
+    packerVersion: '1.5.5'
+
+
+- task: AzureCLI@2
+  displayName: Add Tag
+  condition: and(succeeded(), eq(variables['isBuildImage'], 'true'))
+  inputs:
+    azureSubscription: ${{ parameters.serviceConnection }}
+    addSpnToEnvironment: true
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      az --version
+      echo "setting tag -> contentMd5 [$(BLOB_HASH)]"
+
+      az sig image-version update --gallery-image-version ${{parameters.dest_sig_version}} \
+                                  --gallery-image-definition ${{parameters.dest_sig_definition}} \
+                                  --gallery-name ${{parameters.dest_sig}} \
+                                  --resource-group ${{parameters.dest_sig_rg}} \
+                                  --set tags.contentMd5=$(BLOB_HASH)

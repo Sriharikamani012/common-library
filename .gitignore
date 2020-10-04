@@ -1,0 +1,11 @@
+*.tfstate*
+*.terraform*
+
+# a folder where you can place your secret stuff
+*user_secrets* 
+
+*id_rsa*
+
+*.zip*
+
+*.vscode*
